@@ -1,14 +1,17 @@
-name: Validate CloudFormation
+name: Validate CloudFormation and run Kiro FinOps review
 
 on:
   pull_request:
     types: [opened, ready_for_review, synchronize]
+  issue_comment:
+    types: [created]
 
 permissions:
   contents: read
 
 jobs:
   lint:
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -24,3 +27,24 @@ jobs:
 
       - name: Lint CloudFormation template
         run: cfn-lint s3_intelligent_tiering.yaml
+
+  review:
+    if: >-
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.head.repo.full_name == github.repository) ||
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.pull_request &&
+       contains(github.event.comment.body, '@kiro') &&
+       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Run Kiro FinOps review
+        uses: awssteph/kiro-finops-review@v1.0.0
+        with:
+          kiro_api_key: ${{ secrets.KIRO_API_KEY }}
+          github_token: ${{ github.token }}
