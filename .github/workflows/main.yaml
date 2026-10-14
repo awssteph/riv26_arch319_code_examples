@@ -49,7 +49,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Run Kiro FinOps review
-        uses: awssteph/kiro-finops-review@v1.0.1
+        uses: awssteph/kiro-finops-review@v1.0.2
         with:
           kiro_api_key: ${{ secrets.KIRO_API_KEY }}
           github_token: ${{ github.token }}
