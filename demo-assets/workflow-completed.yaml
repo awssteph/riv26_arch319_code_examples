@@ -28,7 +28,6 @@ jobs:
       - name: Lint CloudFormation templates
         run: cfn-lint 'cloudformation/**/*.yaml'
 
-
   review:
     if: >-
       (github.event_name == 'pull_request' &&
