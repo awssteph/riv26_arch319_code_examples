@@ -3,7 +3,7 @@ AWSTemplateFormatVersion: '2010-09-09'
 Description: Analytics storage buckets
 
 Resources:
-  AnalyticsDataBucket:
+  AnalyticsDataBucket1:
     Type: AWS::S3::Bucket
     Properties:
       BucketName: arc319-analytics-raw-data
