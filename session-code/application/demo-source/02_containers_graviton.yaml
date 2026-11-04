@@ -1,0 +1,49 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Transformation demo: move EKS and Lambda compute from x86_64 to Graviton arm64.'
+
+
+Resources:
+  BackendNodeGroupBefore:
+    Type: AWS::EKS::Nodegroup
+    Properties:
+      ClusterName: 'EksClusterName'
+      InstanceTypes:
+        - t3.large
+      AmiType: AL2023_x86_64_STANDARD
+      CapacityType: ON_DEMAND
+      ScalingConfig:
+        MinSize: 1
+        DesiredSize: 2
+        MaxSize: 4
+      
+
+  DemoFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: Function
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          LOG_LEVEL: INFO
+      Code:
+        ZipFile: |
+          import logging
+          import os
+
+          import boto3
+
+          logging.getLogger().setLevel(os.environ.get("LOG_LEVEL", "INFO"))
+          log = logging.getLogger(__name__)
+          ddb = boto3.client("dynamodb")
+
+          def handler(event, context):
+              table = os.environ["PRODUCTS_TABLE"]
+              log.info("Describing table %s", table)
+              description = ddb.describe_table(TableName=table)
+              count = description["Table"].get("ItemCount", 0)
+              return {"table": table, "itemCount": count}
+
+

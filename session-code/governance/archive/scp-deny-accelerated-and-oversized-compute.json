@@ -1,0 +1,54 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DenyAcceleratedComputeBecauseInferenceIsManaged",
+      "Effect": "Deny",
+      "Action": "ec2:RunInstances",
+      "Resource": "arn:aws:ec2:*:*:instance/*",
+      "Condition": {
+        "ForAnyValue:StringLike": {
+          "ec2:InstanceType": [
+            "p*.*",
+            "g*.*",
+            "trn*.*",
+            "inf*.*",
+            "dl*.*",
+            "f1*.*",
+            "f2*.*",
+            "vt1*.*"
+          ]
+        },
+        "ArnNotLike": {
+          "aws:PrincipalArn": "arn:aws:iam::*:role/SuperAdmin"
+        }
+      }
+    },
+    {
+      "Sid": "DenyOversizedAndBareMetalInstances",
+      "Effect": "Deny",
+      "Action": "ec2:RunInstances",
+      "Resource": "arn:aws:ec2:*:*:instance/*",
+      "Condition": {
+        "ForAnyValue:StringLike": {
+          "ec2:InstanceType": [
+            "*.metal",
+            "*.metal-*",
+            "*.12xlarge",
+            "*.16xlarge",
+            "*.18xlarge",
+            "*.24xlarge",
+            "*.32xlarge",
+            "*.48xlarge",
+            "*.56xlarge",
+            "*.112xlarge",
+            "u-*"
+          ]
+        },
+        "ArnNotLike": {
+          "aws:PrincipalArn": "arn:aws:iam::*:role/SuperAdmin"
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,26 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DenyTagRemoval",
+      "Effect": "Deny",
+      "Action": [
+        "ec2:DeleteTags",
+        "dynamodb:UntagResource",
+        "rds:RemoveTagsFromResource"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "ForAnyValue:StringEquals": {
+          "aws:TagKeys": [
+            "application",
+            "environment"
+          ]
+        },
+        "ArnNotLike": {
+          "aws:PrincipalArn": "arn:aws:iam::*:role/SuperAdmin"
+        }
+      }
+    }
+  ]
+}

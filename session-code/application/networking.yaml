@@ -1,0 +1,265 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  AnyCompanyAssist - Networking layer (deploy FIRST).
+  Reproduces the CDK VPC: 3 AZs, public + private-with-egress subnets, 1 NAT gateway.
+  Exports VPC/subnet values consumed by the main application template via Fn::ImportValue.
+
+# ---------------------------------------------------------------------------
+# This file holds the "essential, do-not-edit" networking. It is deployed once,
+# ahead of the main template. Nothing here is part of the optimisation demo, so
+# it stays out of the main file to keep the editable resources front and centre.
+# ---------------------------------------------------------------------------
+
+Parameters:
+  StackName:
+    Type: String
+    Default: retail
+    Description: Resource prefix / project name. Must match the value used for the main app stack.
+
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: CIDR block for the VPC.
+
+Mappings:
+  # Carve the /16 into six /20s: 3 public, 3 private.
+  SubnetConfig:
+    Public0:  { CIDR: 10.0.0.0/20 }
+    Public1:  { CIDR: 10.0.16.0/20 }
+    Public2:  { CIDR: 10.0.32.0/20 }
+    Private0: { CIDR: 10.0.48.0/20 }
+    Private1: { CIDR: 10.0.64.0/20 }
+    Private2: { CIDR: 10.0.80.0/20 }
+
+Resources:
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${StackName}-Vpc'
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${StackName}-igw'
+
+  VpcGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  # ---- Public subnets (one per AZ) ----------------------------------------
+  PublicSubnet0:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !FindInMap [SubnetConfig, Public0, CIDR]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${StackName}-public-0'
+        # EKS/ALB tags so the AWS Load Balancer Controller can discover subnets
+        - Key: kubernetes.io/role/elb
+          Value: '1'
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !FindInMap [SubnetConfig, Public1, CIDR]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${StackName}-public-1'
+        - Key: kubernetes.io/role/elb
+          Value: '1'
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [2, !GetAZs '']
+      CidrBlock: !FindInMap [SubnetConfig, Public2, CIDR]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${StackName}-public-2'
+        - Key: kubernetes.io/role/elb
+          Value: '1'
+
+  # ---- Private subnets (one per AZ) ---------------------------------------
+  PrivateSubnet0:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !FindInMap [SubnetConfig, Private0, CIDR]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${StackName}-private-0'
+        - Key: kubernetes.io/role/internal-elb
+          Value: '1'
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !FindInMap [SubnetConfig, Private1, CIDR]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${StackName}-private-1'
+        - Key: kubernetes.io/role/internal-elb
+          Value: '1'
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [2, !GetAZs '']
+      CidrBlock: !FindInMap [SubnetConfig, Private2, CIDR]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${StackName}-private-2'
+        - Key: kubernetes.io/role/internal-elb
+          Value: '1'
+
+  # ---- Public routing ------------------------------------------------------
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${StackName}-public-rt'
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet0RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet0
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet1RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  # ---- NAT gateway (single, matches CDK natGateways: 1) --------------------
+  NatEip:
+    Type: AWS::EC2::EIP
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${StackName}-nat-eip'
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref PublicSubnet0
+      Tags:
+        - Key: Name
+          Value: !Sub '${StackName}-nat'
+
+  # All three private subnets share one route table -> the single NAT gateway.
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${StackName}-private-rt'
+
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnet0RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet0
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet1RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+Outputs:
+  VpcId:
+    Description: VPC ID
+    Value: !Ref Vpc
+    Export:
+      Name: !Sub '${StackName}-VpcId'
+
+  VpcCidr:
+    Description: VPC CIDR block
+    Value: !GetAtt Vpc.CidrBlock
+    Export:
+      Name: !Sub '${StackName}-VpcCidr'
+
+  PublicSubnetIds:
+    Description: Comma-separated public subnet IDs
+    Value: !Join [',', [!Ref PublicSubnet0, !Ref PublicSubnet1, !Ref PublicSubnet2]]
+    Export:
+      Name: !Sub '${StackName}-PublicSubnetIds'
+
+  PrivateSubnetIds:
+    Description: Comma-separated private subnet IDs
+    Value: !Join [',', [!Ref PrivateSubnet0, !Ref PrivateSubnet1, !Ref PrivateSubnet2]]
+    Export:
+      Name: !Sub '${StackName}-PrivateSubnetIds'
+
+  PrivateSubnet0Id:
+    Value: !Ref PrivateSubnet0
+    Export:
+      Name: !Sub '${StackName}-PrivateSubnet0Id'
+
+  PrivateSubnet1Id:
+    Value: !Ref PrivateSubnet1
+    Export:
+      Name: !Sub '${StackName}-PrivateSubnet1Id'
+
+  PrivateSubnet2Id:
+    Value: !Ref PrivateSubnet2
+    Export:
+      Name: !Sub '${StackName}-PrivateSubnet2Id'

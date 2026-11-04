@@ -1,0 +1,81 @@
+# ===========================================================================
+# DEMO SNIPPET 2 - DynamoDB table class (IA vs STANDARD) + capacity mode
+# ===========================================================================
+# Teaching artefact only. Trimmed before/after of a few representative tables.
+# Real resources live in ai_app_unoptimized.yaml / ai_app_optimized.yaml.
+#
+# THE STORY: DynamoDB Standard-IA cuts STORAGE cost ~60% but raises per-request
+# cost ~25%. So IA is a WIN for cold, storage-heavy tables and a LOSS for hot
+# tables. The mistake to avoid is flipping the whole fleet to IA. Decide per
+# table, driven by each table's own access pattern.
+#
+#   HOT   -> keep STANDARD:  USERROLE, TASKLIST
+#   COLD  -> move to IA:     SESSION-HISTORY, CUSTOMER_TRANSACTIONS,
+#                            FEEDBACK, IMAGES
+#   REST  -> IA by default:  CUSTOMER, PRODUCTS, SCHEDULE, TIMEOFF,
+#                            DAILY_TASKS_BY_DAY (validate with metrics)
+#
+# SEPARATE DECISION - capacity mode:
+#   Baseline is PAY_PER_REQUEST (on-demand): great for spiky/unknown traffic.
+#   For a table with steady, predictable throughput (e.g. PRODUCTS), switching
+#   to PROVISIONED and buying a capacity/savings plan lowers the per-request
+#   rate further. This is INDEPENDENT of the table-class choice above.
+# ===========================================================================
+
+
+# ---------------------------------------------------------------------------
+# AFTER (optimised): IA is the fleet default, but HOT tables pin STANDARD.
+# ---------------------------------------------------------------------------
+
+# HOT table -> STAYS STANDARD. USERROLE is read on nearly every request (role
+# lookups gate task/schedule access). IA would raise its per-request cost with
+# little storage to save. This is the "don't apply IA blindly" moment.
+# VALIDATE: CloudWatch ConsumedReadCapacityUnits is sustained/high -> STANDARD.
+UserRoleTable_AFTER:
+  Type: AWS::DynamoDB::Table
+  Properties:
+    TableName: !Sub '${StackName}-USERROLE-${Environment}'
+    BillingMode: PAY_PER_REQUEST
+    TableClass: STANDARD          # <-- pinned, NOT inheriting the IA default
+    AttributeDefinitions:
+      - { AttributeName: userId, AttributeType: S }
+    KeySchema:
+      - { AttributeName: userId, KeyType: HASH }
+
+# COLD table -> MOVES TO IA. SESSION-HISTORY accumulates rows that are almost
+# never re-read. Storage-heavy + low read volume = IA is a straight win.
+# VALIDATE: CloudWatch shows low, spiky reads and large table size -> IA.
+SessionHistoryTable_AFTER:
+  Type: AWS::DynamoDB::Table
+  Properties:
+    TableName: !Sub '${StackName}-SESSION-HISTORY-${Environment}'
+    BillingMode: PAY_PER_REQUEST
+    TableClass: STANDARD_INFREQUENT_ACCESS   # <-- IA
+    AttributeDefinitions:
+      - { AttributeName: userId_sessionId, AttributeType: S }
+      - { AttributeName: timestamp, AttributeType: N }
+    KeySchema:
+      - { AttributeName: userId_sessionId, KeyType: HASH }
+      - { AttributeName: timestamp, KeyType: RANGE }
+
+
+# ---------------------------------------------------------------------------
+# CAPACITY-MODE example (separate lever). PRODUCTS has steady, predictable
+# reads, so provisioned capacity + a capacity/savings plan beats on-demand.
+# Shown here as a talking point; keep it distinct from the table-class choice.
+# VALIDATE: confirm steady throughput in CloudWatch before committing, and size
+# provisioned RCUs/WCUs to the observed p90 with auto-scaling headroom.
+# ---------------------------------------------------------------------------
+ProductsTable_CAPACITY_EXAMPLE:
+  Type: AWS::DynamoDB::Table
+  Properties:
+    TableName: !Sub '${StackName}-PRODUCTS-${Environment}'
+    BillingMode: PROVISIONED      # <-- was PAY_PER_REQUEST
+    ProvisionedThroughput:
+      ReadCapacityUnits: 5
+      WriteCapacityUnits: 5
+    TableClass: STANDARD_INFREQUENT_ACCESS
+    AttributeDefinitions:
+      - { AttributeName: productId, AttributeType: S }
+    KeySchema:
+      - { AttributeName: productId, KeyType: HASH }

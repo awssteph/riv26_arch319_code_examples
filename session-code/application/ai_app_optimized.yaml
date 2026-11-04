@@ -1,0 +1,1468 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  AnyCompanyAssist - AI-powered retail workforce application (OPTIMISED VERSION).
+  Single-file CloudFormation conversion of the CDK guidance, for an architecture /
+  cost-optimisation demo. Deploy application/networking.yaml FIRST, then this template.
+
+  This is the OPTIMISED "after" version. It is a copy of ai_app_unoptimized.yaml with
+  the tradeoffs.md levers applied. Every change is tagged with a "# OPTIMISED:" comment
+  describing what changed and why, and a "# VALIDATE:" comment describing how to confirm
+  the change is safe before adopting it. Diff this file against ai_app_unoptimized.yaml
+  to drive the trade-off talk.
+
+  NOTE: This is an architecture artefact. It is not intended to be deployed live.
+  The in-cluster workload (Deployment/Service/Ingress, ALB controller, Docker image)
+  is still applied by deploy.sh with kubectl/helm after the stack, exactly as in CDK.
+
+# ===========================================================================
+#  OPTIMISED VERSION - read the "# OPTIMISED:" and "# VALIDATE:" comments.
+#  Each change carries: what changed + why (OPTIMISED) and how to confirm it is
+#  safe before adopting (VALIDATE). Diff against ai_app_unoptimized.yaml.
+#
+#  DEMO EDIT SURFACE
+#  The five resource groups the presenter edits during the trade-off talk are
+#  hoisted to the TOP of the Resources section (see the FOCUS RESOURCES banner):
+#    1. Containers    - EKS cluster + managed node group + ECR
+#    2. DynamoDB      - 11 application tables
+#    3. S3            - website + data + access-logs buckets
+#    4. Bedrock       - Guardrail + Knowledge Base + Data Source
+#    5. OpenSearch    - Serverless vector collection + policies + index
+#  Their tunable knobs are exposed as Parameters below so they can be changed
+#  without touching resource bodies.
+# ===========================================================================
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: 'General' }
+        Parameters: [StackName, NetworkStackName, Environment, EmailAddress, InitialPassword]
+      - Label: { default: 'FOCUS 1 - Containers (EKS / ECR)' }
+        Parameters: [NodeInstanceType, NodeAmiType, NodeCapacityType, NodeDesiredSize, NodeMinSize, NodeMaxSize, NodeDiskSize, KubernetesVersion]
+      - Label: { default: 'FOCUS 2 - DynamoDB' }
+        Parameters: [DynamoBillingMode, DynamoTableClass, PointInTimeRecovery]
+      - Label: { default: 'FOCUS 3 - S3' }
+        Parameters: [S3StorageClassNote, EnableS3IntelligentTiering, AccessLogRetentionDays]
+      - Label: { default: 'FOCUS 4 - Bedrock' }
+        Parameters: [BedrockModelId, EmbeddingModelId, EmbeddingDimensions]
+      - Label: { default: 'FOCUS 5 - OpenSearch Serverless' }
+        Parameters: [OpenSearchStandbyReplicas]
+      - Label: { default: 'CloudWatch logging (optimisation talking point)' }
+        Parameters: [DemoLogRetentionDays, LogLevel]
+
+Parameters:
+
+  # ---- General -------------------------------------------------------------
+  StackName:
+    Type: String
+    Default: retail
+    Description: >
+      Resource prefix for THIS app stack's resources (tables, cluster, roles, etc.).
+      Change it (e.g. retail2) to deploy a second, non-conflicting app stack.
+  NetworkStackName:
+    Type: String
+    Default: retail
+    Description: >
+      StackName of the networking stack whose exports to import (VPC/subnets).
+      Kept SEPARATE from StackName so a second app stack (StackName=retail2) can
+      still share the ORIGINAL networking (NetworkStackName=retail) instead of
+      redeploying it.
+  Environment:
+    Type: String
+    Default: DEV
+    AllowedValues: [DEV, PROD]
+    Description: Environment suffix used in table names and log tuning decisions.
+  EmailAddress:
+    Type: String
+    Default: you@example.com
+    Description: Email for the initial Cognito store-manager user and synthetic data owner.
+  InitialPassword:
+    Type: String
+    Default: 'TempPassword123!'
+    NoEcho: true
+    Description: Initial Cognito password for the demo user.
+
+  # ---- FOCUS 1: Containers -------------------------------------------------
+  NodeInstanceType:
+    # OPTIMISED: x86 t3.medium -> Graviton t4g.medium. Graviton (ARM) nodes are
+    # ~20% cheaper than equivalent x86 for the same 2 vCPU / 4 GiB shape, and the
+    # workload is a stateless Python container that runs fine on ARM.
+    # VALIDATE:
+    #   1. Container image is multi-arch or arm64. Rebuild backend with
+    #      `docker build --platform=linux/arm64` and confirm it pushes/runs.
+    #      Check every base image + pip wheel resolves for aarch64.
+    #   2. Right-sizing: after a load test, check CloudWatch Container Insights
+    #      node_cpu_utilization / node_memory_utilization. tradeoffs.md notes the
+    #      Python backend is largely single-threaded per request, so a smaller
+    #      shape may suffice - confirm p90 CPU < ~60% before downsizing further.
+    #   3. Capacity/AZ: confirm t4g is available in all 3 target AZs.
+    Type: String
+    Default: t4g.medium
+    Description: >
+      EKS worker node instance type. OPTIMISED: Graviton t4g.medium.
+      Must be paired with an ARM AMI (see NodeAmiType) and an arm64 image.
+  NodeAmiType:
+    # OPTIMISED: switched to the ARM AMI to match the Graviton instance type.
+    # VALIDATE: the node AMI arch MUST match InstanceTypes arch, or nodes fail to
+    # join. AL2023_ARM_64_STANDARD pairs with t4g/m7g; keep them in lockstep.
+    Type: String
+    Default: AL2023_ARM_64_STANDARD
+    AllowedValues: [AL2023_x86_64_STANDARD, AL2023_ARM_64_STANDARD]
+    Description: Node AMI architecture. OPTIMISED to ARM_64 for Graviton.
+  NodeCapacityType:
+    # OPTIMISED: left ON_DEMAND. SPOT would cut node cost further but adds
+    # interruption risk; keep it a deliberate, separately-validated step.
+    # VALIDATE: before moving to SPOT, confirm the workload tolerates node
+    # reclamation (graceful shutdown, replicas > 1, PodDisruptionBudget) and
+    # check the SPOT interruption rate for t4g.medium in your Region.
+    Type: String
+    Default: ON_DEMAND
+    AllowedValues: [ON_DEMAND, SPOT]
+    Description: 'Node capacity type. Kept ON_DEMAND; SPOT is a separate validated step.'
+  NodeDesiredSize:
+    Type: Number
+    Default: 2
+    Description: Desired node count.
+  NodeMinSize:
+    Type: Number
+    Default: 1
+    Description: Minimum node count.
+  NodeMaxSize:
+    Type: Number
+    Default: 4
+    Description: Maximum node count.
+  NodeDiskSize:
+    Type: Number
+    Default: 20
+    Description: Node EBS volume size (GiB).
+  KubernetesVersion:
+    Type: String
+    Default: '1.33'
+    Description: EKS control-plane version.
+
+  # ---- FOCUS 2: DynamoDB ---------------------------------------------------
+  DynamoBillingMode:
+    Type: String
+    Default: PAY_PER_REQUEST
+    AllowedValues: [PAY_PER_REQUEST, PROVISIONED]
+    Description: >
+      Billing mode for all tables. UN-OPTIMISED: PAY_PER_REQUEST everywhere.
+      Optimisation levers (tradeoffs.md): infrequent-access table class, and
+      provisioned capacity + savings/capacity plans for steady tables.
+  DynamoTableClass:
+    # OPTIMISED: STANDARD -> STANDARD_INFREQUENT_ACCESS. IA class cuts storage
+    # cost ~60% in exchange for ~25% higher read/write request cost, so it only
+    # wins for tables that are storage-heavy and infrequently accessed.
+    # VALIDATE: this is applied fleet-wide here for the demo, but that is NOT
+    # correct for every table. Before adopting, check per-table in CloudWatch:
+    #   - ConsumedRead/WriteCapacityUnits (low & spiky -> IA is a good fit)
+    #   - table size vs. request volume (big + rarely read -> IA wins)
+    # Good IA candidates here: SESSION-HISTORY, CUSTOMER_TRANSACTIONS, FEEDBACK,
+    # IMAGES. Hot tables (USERROLE, TASKLIST) should likely stay STANDARD - see
+    # the per-table override note in the DynamoDB resource section below.
+    Type: String
+    Default: STANDARD_INFREQUENT_ACCESS
+    AllowedValues: [STANDARD, STANDARD_INFREQUENT_ACCESS]
+    Description: 'Table class. OPTIMISED: IA class. Validate per-table before fleet-wide adoption.'
+  PointInTimeRecovery:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable PITR on tables (matches CDK baseline).
+
+  # ---- FOCUS 3: S3 ---------------------------------------------------------
+  S3StorageClassNote:
+    Type: String
+    Default: STANDARD
+    AllowedValues: [STANDARD]
+    Description: >
+      Informational. UN-OPTIMISED: plain S3 Standard, no lifecycle rules on the
+      data bucket. Optimisation lever (tradeoffs.md): enable Intelligent-Tiering,
+      then use S3 Storage Lens to learn access patterns before finer prefix rules.
+  EnableS3IntelligentTiering:
+    # OPTIMISED: false -> true. Intelligent-Tiering auto-moves objects between
+    # access tiers based on usage, with no retrieval fees. It is a safe default
+    # when the access pattern is unknown (exactly the tradeoffs.md rationale).
+    # VALIDATE:
+    #   - There is a small monitoring/automation charge per object; it only pays
+    #     off for objects > 128 KB and kept > 30 days. Confirm the data bucket
+    #     holds larger, longer-lived objects (SOP docs, images) - it does here.
+    #   - Enable S3 Storage Lens and review access patterns after ~30 days before
+    #     adding finer per-prefix lifecycle rules (the next optimisation step).
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: OPTIMISED to true. Validate object size/lifetime and review with Storage Lens.
+  AccessLogRetentionDays:
+    Type: Number
+    Default: 90
+    Description: Access-log object expiration on the logs bucket (days).
+
+  # ---- FOCUS 4: Bedrock ----------------------------------------------------
+  BedrockModelId:
+    Type: String
+    Default: global.amazon.nova-2-lite-v1:0
+    Description: >
+      Foundation model used by the backend. Optimisation lever (tradeoffs.md):
+      Bedrock prompt optimisation to cut input/output tokens.
+  EmbeddingModelId:
+    Type: String
+    Default: amazon.titan-embed-text-v2:0
+    Description: Embedding model for the Knowledge Base vector index.
+  EmbeddingDimensions:
+    Type: Number
+    Default: 1024
+    AllowedValues: [256, 512, 1024]
+    Description: Embedding vector dimensions. Must match the OpenSearch index mapping.
+
+  # ---- FOCUS 5: OpenSearch Serverless -------------------------------------
+  OpenSearchStandbyReplicas:
+    # OPTIMISED: ENABLED -> DISABLED. Standby replicas keep redundant OCUs warm in
+    # a second AZ. Disabling roughly halves OCU count - and OCUs are the biggest
+    # line item in this stack (~$350/mo in the cost table), so this is the single
+    # largest saving in the demo.
+    # VALIDATE:
+    #   - This trades away AZ-level redundancy / faster failover. Acceptable for
+    #     DEV and most demo/non-prod. For PROD, confirm the RTO/availability SLA
+    #     tolerates it before disabling (consider keeping ENABLED for PROD).
+    #   - StandbyReplicas is set at collection creation and changing it REPLACES
+    #     the collection (data loss + KB re-index). Decide before first deploy.
+    Type: String
+    Default: DISABLED
+    AllowedValues: [ENABLED, DISABLED]
+    Description: >
+      Collection standby replicas. OPTIMISED: DISABLED (non-prod). Biggest saving in
+      the stack. Validate availability SLA for PROD; changing it replaces the collection.
+
+  # ---- CloudWatch logging (optimisation talking point) --------------------
+  DemoLogRetentionDays:
+    # OPTIMISED: 0 (never expire) -> 30 days. Unbounded log retention accrues
+    # storage cost forever; a finite retention is the simplest CloudWatch saving.
+    # VALIDATE: confirm 30 days meets any audit/compliance log-retention
+    # requirement. If longer retention is mandated, keep the value higher but
+    # still finite, and/or export to S3 + lifecycle for cheaper long-term storage.
+    Type: Number
+    Default: 30
+    Description: >
+      Retention (days) for the demo Lambda's explicit log group. OPTIMISED: 30.
+      Validate against audit/compliance retention needs.
+  LogLevel:
+    # OPTIMISED: DEBUG -> INFO. DEBUG emits high-volume logs (ingestion + storage
+    # cost, and noise). INFO keeps operational visibility at a fraction of volume.
+    # VALIDATE: confirm INFO still captures what on-call needs to triage. Keep the
+    # ability to raise back to DEBUG temporarily when actively debugging an issue.
+    Type: String
+    Default: INFO
+    AllowedValues: [DEBUG, INFO, WARN, ERROR]
+    Description: >
+      Application/Lambda log verbosity. OPTIMISED: INFO (lower volume than DEBUG).
+      Validate INFO covers triage needs; raise to DEBUG temporarily when needed.
+
+Conditions:
+  IsProd: !Equals [!Ref Environment, PROD]
+  NeverExpireLogs: !Equals [!Ref DemoLogRetentionDays, 0]
+  UseIntelligentTiering: !Equals [!Ref EnableS3IntelligentTiering, 'true']
+  EnablePitr: !Equals [!Ref PointInTimeRecovery, 'true']
+
+Resources:
+
+  # #########################################################################
+  # #                                                                       #
+  # #   FOCUS RESOURCES - the demo edit surface starts here                 #
+  # #   (containers, DynamoDB, S3, Bedrock, OpenSearch)                     #
+  # #                                                                       #
+  # #########################################################################
+
+  # =========================================================================
+  # FOCUS 3: S3   (defined first because other focus resources depend on the
+  #               data bucket: OpenSearch KB data source, backend, seeder)
+  # UN-OPTIMISED: S3 Standard, no Intelligent-Tiering, no data-bucket lifecycle.
+  # =========================================================================
+
+  # Access-logs bucket (target for website + data server access logs).
+  AccessLogsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldAccessLogs
+            Status: Enabled
+            ExpirationInDays: !Ref AccessLogRetentionDays
+
+  AccessLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AccessLogsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowSSLRequestsOnly
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt AccessLogsBucket.Arn
+              - !Sub '${AccessLogsBucket.Arn}/*'
+            Condition:
+              Bool: { 'aws:SecureTransport': 'false' }
+          - Sid: S3ServerAccessLogsPolicy
+            Effect: Allow
+            Principal: { Service: logging.s3.amazonaws.com }
+            Action: 's3:PutObject'
+            Resource: !Sub '${AccessLogsBucket.Arn}/*'
+
+  # Website bucket - static frontend origin for CloudFront.
+  WebsiteBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogsBucket
+        LogFilePrefix: website-access-logs/
+
+  # Data bucket - SOP documents + image uploads; source for the Bedrock KB.
+  # UN-OPTIMISED: no LifecycleConfiguration, no IntelligentTieringConfiguration
+  # unless EnableS3IntelligentTiering is flipped on (baseline = false).
+  DataBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogsBucket
+        LogFilePrefix: data-access-logs/
+      # OPTIMISED: Intelligent-Tiering is now ON (EnableS3IntelligentTiering=true).
+      # VALIDATE: pays off for objects > 128 KB kept > 30 days; review S3 Storage
+      # Lens after ~30 days before adding finer per-prefix lifecycle rules.
+      IntelligentTieringConfigurations:
+        !If
+          - UseIntelligentTiering
+          - - Id: EntireBucketIntelligentTiering
+              Status: Enabled
+              Tierings:
+                - AccessTier: ARCHIVE_ACCESS
+                  Days: 90
+                - AccessTier: DEEP_ARCHIVE_ACCESS
+                  Days: 180
+          - !Ref AWS::NoValue
+
+  DataBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DataBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowSSLRequestsOnly
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt DataBucket.Arn
+              - !Sub '${DataBucket.Arn}/*'
+            Condition:
+              Bool: { 'aws:SecureTransport': 'false' }
+
+  # =========================================================================
+  # FOCUS 2: DynamoDB   (11 application tables)
+  # OPTIMISED: DynamoTableClass now defaults to STANDARD_INFREQUENT_ACCESS, so
+  # every table that references the parameter moves to IA.
+  #
+  # IMPORTANT - IA is NOT right for every table. IA cuts storage cost but raises
+  # per-request cost, so HOT tables should stay STANDARD. Below we demonstrate a
+  # per-table override: USERROLE and TASKLIST (read on nearly every request) pin
+  # TableClass: STANDARD explicitly instead of inheriting the IA parameter.
+  # VALIDATE per table in CloudWatch before choosing IA vs STANDARD:
+  #   - ConsumedRead/WriteCapacityUnits (sustained high -> keep STANDARD)
+  #   - table size vs request volume (large + cold -> IA wins)
+  # Table names match the CDK pattern: ${StackName}-<NAME>-${Environment}
+  # =========================================================================
+
+  SessionHistoryTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TableName: !Sub '${StackName}-SESSION-HISTORY-${Environment}'
+      BillingMode: !Ref DynamoBillingMode
+      TableClass: !Ref DynamoTableClass
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [EnablePitr, true, false]
+      AttributeDefinitions:
+        - { AttributeName: userId_sessionId, AttributeType: S }
+        - { AttributeName: timestamp, AttributeType: N }
+      KeySchema:
+        - { AttributeName: userId_sessionId, KeyType: HASH }
+        - { AttributeName: timestamp, KeyType: RANGE }
+
+  UserTasksTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TableName: !Sub '${StackName}-TASKLIST-${Environment}'
+      BillingMode: !Ref DynamoBillingMode
+      # OPTIMISED (per-table override): TASKLIST is read on almost every request
+      # (task lists, status). Pin STANDARD instead of inheriting the IA parameter.
+      # VALIDATE: confirm sustained read volume in CloudWatch justifies STANDARD.
+      TableClass: STANDARD
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [EnablePitr, true, false]
+      AttributeDefinitions:
+        - { AttributeName: userId, AttributeType: S }
+        - { AttributeName: taskId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: userId, KeyType: HASH }
+        - { AttributeName: taskId, KeyType: RANGE }
+
+  UserRoleTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TableName: !Sub '${StackName}-USERROLE-${Environment}'
+      BillingMode: !Ref DynamoBillingMode
+      # OPTIMISED (per-table override): USERROLE is read on nearly every request
+      # (role lookups gate task/schedule access). Pin STANDARD, not IA.
+      # VALIDATE: confirm sustained read volume in CloudWatch justifies STANDARD.
+      TableClass: STANDARD
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [EnablePitr, true, false]
+      AttributeDefinitions:
+        - { AttributeName: userId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: userId, KeyType: HASH }
+
+  CustomerTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TableName: !Sub '${StackName}-CUSTOMER-${Environment}'
+      BillingMode: !Ref DynamoBillingMode
+      TableClass: !Ref DynamoTableClass
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [EnablePitr, true, false]
+      AttributeDefinitions:
+        - { AttributeName: customerId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: customerId, KeyType: HASH }
+
+  DailyTasksByDayTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TableName: !Sub '${StackName}-DAILY_TASKS_BY_DAY-${Environment}'
+      BillingMode: !Ref DynamoBillingMode
+      TableClass: !Ref DynamoTableClass
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [EnablePitr, true, false]
+      AttributeDefinitions:
+        - { AttributeName: taskId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: taskId, KeyType: HASH }
+
+  ScheduleTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TableName: !Sub '${StackName}-SCHEDULE-${Environment}'
+      BillingMode: !Ref DynamoBillingMode
+      TableClass: !Ref DynamoTableClass
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [EnablePitr, true, false]
+      AttributeDefinitions:
+        - { AttributeName: userId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: userId, KeyType: HASH }
+
+  TimeoffTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TableName: !Sub '${StackName}-TIMEOFF-${Environment}'
+      BillingMode: !Ref DynamoBillingMode
+      TableClass: !Ref DynamoTableClass
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [EnablePitr, true, false]
+      AttributeDefinitions:
+        - { AttributeName: userId, AttributeType: S }
+        - { AttributeName: timeoffId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: userId, KeyType: HASH }
+        - { AttributeName: timeoffId, KeyType: RANGE }
+
+  ProductsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TableName: !Sub '${StackName}-PRODUCTS-${Environment}'
+      BillingMode: !Ref DynamoBillingMode
+      TableClass: !Ref DynamoTableClass
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [EnablePitr, true, false]
+      AttributeDefinitions:
+        - { AttributeName: productId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: productId, KeyType: HASH }
+
+  CustomerTransactionsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TableName: !Sub '${StackName}-CUSTOMER_TRANSACTIONS-${Environment}'
+      BillingMode: !Ref DynamoBillingMode
+      TableClass: !Ref DynamoTableClass
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [EnablePitr, true, false]
+      AttributeDefinitions:
+        - { AttributeName: customerId, AttributeType: S }
+        - { AttributeName: transactionId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: customerId, KeyType: HASH }
+        - { AttributeName: transactionId, KeyType: RANGE }
+
+  FeedbackTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TableName: !Sub '${StackName}-FEEDBACK-${Environment}'
+      BillingMode: !Ref DynamoBillingMode
+      TableClass: !Ref DynamoTableClass
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [EnablePitr, true, false]
+      AttributeDefinitions:
+        - { AttributeName: messageId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: messageId, KeyType: HASH }
+
+  ImagesTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TableName: !Sub '${StackName}-IMAGES-${Environment}'
+      BillingMode: !Ref DynamoBillingMode
+      TableClass: !Ref DynamoTableClass
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [EnablePitr, true, false]
+      AttributeDefinitions:
+        - { AttributeName: imageId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: imageId, KeyType: HASH }
+
+  # =========================================================================
+  # FOCUS 1: Containers   (EKS cluster + managed node group + ECR)
+  # UN-OPTIMISED: x86 (t3.medium) ON_DEMAND nodes, AL2023 x86 AMI.
+  # Optimisation levers (tradeoffs.md): Graviton (t4g/m7g + ARM AMI), right-size
+  # after checking multithreading headroom, optionally SPOT for burst capacity,
+  # track utilisation in CloudWatch.
+  #
+  # Reproduces the CDK EKS stack's AWS resources. The in-cluster objects the CDK
+  # applied via kubectl/Helm (aws-auth, namespace, ALB controller, backend
+  # Deployment/Service/Ingress) are still applied by deploy.sh post-stack.
+  # =========================================================================
+
+  # ECR repository for the backend container image.
+  BackendRepository:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      RepositoryName: !Sub '${StackName}-backend'
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep only the 2 most recent images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 2
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+
+  # --- EKS control-plane IAM role ------------------------------------------
+  EksClusterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: eks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
+
+  # --- EKS worker node IAM role --------------------------------------------
+  NodeGroupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: IAM role for EKS node group
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+
+  # --- ALB security group (matches CDK: 80/443 in, restricted egress) ------
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for the Application Load Balancer
+      VpcId:
+        Fn::ImportValue: !Sub '${NetworkStackName}-VpcId'
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: Allow HTTPS from anywhere
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: Allow HTTP from anywhere (redirect to HTTPS)
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 30000
+          ToPort: 32767
+          CidrIp:
+            Fn::ImportValue: !Sub '${NetworkStackName}-VpcCidr'
+          Description: Allow traffic to NodePort range in the EKS cluster
+        - IpProtocol: tcp
+          FromPort: 8000
+          ToPort: 8000
+          CidrIp:
+            Fn::ImportValue: !Sub '${NetworkStackName}-VpcCidr'
+          Description: Allow traffic to backend service on port 8000
+      Tags:
+        - Key: Name
+          Value: !Sub '${StackName}-alb-sg'
+
+  # --- EKS cluster ----------------------------------------------------------
+  EksCluster:
+    Type: AWS::EKS::Cluster
+    Properties:
+      Name: !Sub '${StackName}-cluster'
+      Version: !Ref KubernetesVersion
+      RoleArn: !GetAtt EksClusterRole.Arn
+      AccessConfig:
+        AuthenticationMode: API
+      Logging:
+        ClusterLogging:
+          EnabledTypes:
+            - Type: api
+            - Type: audit
+            - Type: authenticator
+            - Type: controllerManager
+            - Type: scheduler
+      ResourcesVpcConfig:
+        EndpointPublicAccess: true
+        EndpointPrivateAccess: true
+        SubnetIds:
+          - Fn::ImportValue: !Sub '${NetworkStackName}-PrivateSubnet0Id'
+          - Fn::ImportValue: !Sub '${NetworkStackName}-PrivateSubnet1Id'
+          - Fn::ImportValue: !Sub '${NetworkStackName}-PrivateSubnet2Id'
+
+  # --- Managed node group (the "containers" compute the demo edits) --------
+  BackendNodeGroup:
+    Type: AWS::EKS::Nodegroup
+    Properties:
+      ClusterName: !Ref EksCluster
+      NodeRole: !GetAtt NodeGroupRole.Arn
+      # UN-OPTIMISED knobs, all parameterised for the trade-off talk:
+      InstanceTypes:
+        - !Ref NodeInstanceType
+      AmiType: !Ref NodeAmiType
+      CapacityType: !Ref NodeCapacityType
+      DiskSize: !Ref NodeDiskSize
+      ScalingConfig:
+        MinSize: !Ref NodeMinSize
+        DesiredSize: !Ref NodeDesiredSize
+        MaxSize: !Ref NodeMaxSize
+      Subnets:
+        - Fn::ImportValue: !Sub '${NetworkStackName}-PrivateSubnet0Id'
+        - Fn::ImportValue: !Sub '${NetworkStackName}-PrivateSubnet1Id'
+        - Fn::ImportValue: !Sub '${NetworkStackName}-PrivateSubnet2Id'
+      Labels:
+        role: application
+        workload-type: general
+        environment: !Ref Environment
+      Tags:
+        Name: !Sub '${StackName}-worker-node'
+        Environment: !Ref Environment
+        Purpose: Application workloads
+
+  # --- EKS Pod Identity Agent add-on ---------------------------------------
+  PodIdentityAgentAddon:
+    Type: AWS::EKS::Addon
+    Properties:
+      AddonName: eks-pod-identity-agent
+      ClusterName: !Ref EksCluster
+      ResolveConflicts: OVERWRITE
+
+  # =========================================================================
+  # FOCUS 5: OpenSearch Serverless   (vector store for the SOP knowledge base)
+  # UN-OPTIMISED: standby replicas ENABLED (redundant OCUs). This is the single
+  # biggest line item in the cost table (~$350/mo). Optimisation lever: disable
+  # standby replicas for non-prod to roughly halve search/index OCUs.
+  # =========================================================================
+
+  # Encryption policy (AWS-owned key).
+  OpenSearchEncryptionPolicy:
+    Type: AWS::OpenSearchServerless::SecurityPolicy
+    Properties:
+      Name: !Sub '${StackName}-enc-policy'
+      Type: encryption
+      Description: Encryption policy for the AOSS collection
+      Policy: !Sub |
+        {
+          "Rules": [
+            { "ResourceType": "collection", "Resource": ["collection/${StackName}-collection"] }
+          ],
+          "AWSOwnedKey": true
+        }
+
+  # Network policy (public access, matches CDK AllowFromPublic).
+  OpenSearchNetworkPolicy:
+    Type: AWS::OpenSearchServerless::SecurityPolicy
+    Properties:
+      Name: !Sub '${StackName}-net-policy'
+      Type: network
+      Description: Network policy for the AOSS collection
+      Policy: !Sub |
+        [
+          {
+            "Rules": [
+              { "ResourceType": "collection", "Resource": ["collection/${StackName}-collection"] },
+              { "ResourceType": "dashboard",  "Resource": ["collection/${StackName}-collection"] }
+            ],
+            "AllowFromPublic": true
+          }
+        ]
+
+  # Data access policy - principals allowed to read/write the collection + index.
+  OpenSearchDataAccessPolicy:
+    Type: AWS::OpenSearchServerless::AccessPolicy
+    Properties:
+      Name: !Sub '${StackName}-data-policy'
+      Type: data
+      Description: Access policy for the AOSS collection
+      Policy: !Sub
+        - |
+          [
+            {
+              "Description": "Access for Bedrock KB, backend, and deployer",
+              "Rules": [
+                { "ResourceType": "collection", "Resource": ["collection/${StackName}-collection"], "Permission": ["aoss:*"] },
+                { "ResourceType": "index", "Resource": ["index/${StackName}-collection/*"], "Permission": ["aoss:*"] }
+              ],
+              "Principal": [
+                "${KbRoleArn}",
+                "${BackendRoleArn}",
+                "arn:aws:iam::${AWS::AccountId}:root"
+              ]
+            }
+          ]
+        - KbRoleArn: !GetAtt BedrockKnowledgeBaseRole.Arn
+          BackendRoleArn: !GetAtt BackendServiceAccountRole.Arn
+
+  # Vector-search collection.
+  OpenSearchCollection:
+    Type: AWS::OpenSearchServerless::Collection
+    DependsOn:
+      - OpenSearchEncryptionPolicy
+      - OpenSearchNetworkPolicy
+    Properties:
+      Name: !Sub '${StackName}-collection'
+      Type: VECTORSEARCH
+      Description: !Sub 'Collection to hold ${StackName} data'
+      StandbyReplicas: !Ref OpenSearchStandbyReplicas
+
+  # Vector index (native AOSS index resource, matches CDK CfnIndex).
+  OpenSearchIndex:
+    Type: AWS::OpenSearchServerless::Index
+    DependsOn:
+      - OpenSearchDataAccessPolicy
+    Properties:
+      CollectionEndpoint: !GetAtt OpenSearchCollection.CollectionEndpoint
+      IndexName: !Sub '${StackName}-sop'
+      Settings:
+        Index:
+          Knn: true
+      Mappings:
+        Properties:
+          vector:
+            Type: knn_vector
+            Dimension: !Ref EmbeddingDimensions
+            Method:
+              Name: hnsw
+              Engine: faiss
+              SpaceType: l2
+              Parameters:
+                EfConstruction: 512
+                M: 16
+          text:
+            Type: text
+          metadata:
+            Type: text
+
+  # =========================================================================
+  # FOCUS 4: Bedrock   (Guardrail + Knowledge Base + S3 Data Source)
+  # UN-OPTIMISED: no prompt optimisation. Optimisation lever (tradeoffs.md):
+  # Bedrock prompt optimisation to reduce input/output token spend; track token
+  # usage in CloudWatch.
+  # =========================================================================
+
+  # IAM role Bedrock assumes to read the data bucket and call the collection.
+  BedrockKnowledgeBaseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'AmazonBedrockExecutionRoleForKB-${StackName}-collection'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: bedrock.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+              ArnLike:
+                'AWS:SourceArn': !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:knowledge-base/*'
+      Policies:
+        - PolicyName: KbS3AndAossAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ['s3:Get*', 's3:List*', 's3:Describe*']
+                Resource:
+                  - !GetAtt DataBucket.Arn
+                  - !Sub '${DataBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - 'aoss:APIAccessAll'
+                  - 'aoss:DashboardsAccessAll'
+                Resource: !Sub 'arn:aws:aoss:${AWS::Region}:${AWS::AccountId}:collection/*'
+              - Effect: Allow
+                Action: ['bedrock:InvokeModel']
+                Resource: !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/*'
+
+  BedrockKnowledgeBase:
+    Type: AWS::Bedrock::KnowledgeBase
+    DependsOn:
+      - OpenSearchIndex
+    Properties:
+      Name: !Sub '${StackName}-collection'
+      Description: !Sub 'Knowledge base for ${StackName}'
+      RoleArn: !GetAtt BedrockKnowledgeBaseRole.Arn
+      KnowledgeBaseConfiguration:
+        Type: VECTOR
+        VectorKnowledgeBaseConfiguration:
+          EmbeddingModelArn: !Sub 'arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/${EmbeddingModelId}'
+          EmbeddingModelConfiguration:
+            BedrockEmbeddingModelConfiguration:
+              Dimensions: !Ref EmbeddingDimensions
+      StorageConfiguration:
+        Type: OPENSEARCH_SERVERLESS
+        OpensearchServerlessConfiguration:
+          CollectionArn: !GetAtt OpenSearchCollection.Arn
+          VectorIndexName: !Sub '${StackName}-sop'
+          FieldMapping:
+            VectorField: vector
+            TextField: text
+            MetadataField: metadata
+
+  BedrockDataSource:
+    Type: AWS::Bedrock::DataSource
+    Properties:
+      KnowledgeBaseId: !Ref BedrockKnowledgeBase
+      Name: !Sub '${StackName}-collection'
+      DataDeletionPolicy: RETAIN
+      DataSourceConfiguration:
+        Type: S3
+        S3Configuration:
+          BucketArn: !GetAtt DataBucket.Arn
+          InclusionPrefixes:
+            - app/
+
+  BedrockGuardrail:
+    Type: AWS::Bedrock::Guardrail
+    Properties:
+      Name: !Sub '${StackName}-guardrail-${Environment}'
+      Description: Legal/ethical guardrails for the retail assistant.
+      BlockedInputMessaging: Your input contains content that violates our usage policies.
+      BlockedOutputsMessaging: The response contains content that violates our usage policies.
+      ContentPolicyConfig:
+        FiltersConfig:
+          - { Type: SEXUAL,    InputStrength: HIGH, OutputStrength: HIGH }
+          - { Type: VIOLENCE,  InputStrength: HIGH, OutputStrength: HIGH }
+          - { Type: HATE,      InputStrength: HIGH, OutputStrength: HIGH }
+          - { Type: INSULTS,   InputStrength: HIGH, OutputStrength: HIGH }
+          - { Type: MISCONDUCT, InputStrength: HIGH, OutputStrength: HIGH }
+      SensitiveInformationPolicyConfig:
+        PiiEntitiesConfig:
+          - { Type: ADDRESS, Action: ANONYMIZE }
+        RegexesConfig:
+          - Name: CustomerIDPattern
+            Description: Pattern for customer IDs
+            Pattern: '^[A-Z]{2}\d{6}$'
+            Action: ANONYMIZE
+      ContextualGroundingPolicyConfig:
+        FiltersConfig:
+          - { Type: GROUNDING, Threshold: 0.5 }
+          - { Type: RELEVANCE, Threshold: 0.5 }
+      TopicPolicyConfig:
+        TopicsConfig:
+          - Name: FINANCIAL_ADVICE
+            Type: DENY
+            Definition: Offering guidance or suggestions on financial investments, planning, or decisions.
+          - Name: LEGAL_ADVICE
+            Type: DENY
+            Definition: Offering guidance or suggestions on legal matters, actions, or rights.
+            Examples:
+              - Can I sue someone for this?
+              - What are my legal rights in this situation?
+      WordPolicyConfig:
+        WordsConfig:
+          - Text: drugs
+        ManagedWordListsConfig:
+          - Type: PROFANITY
+
+  # #########################################################################
+  # #                                                                       #
+  # #   ESSENTIAL GLUE - not part of the optimisation demo edit surface.    #
+  # #   Auth (Cognito), backend workload IAM role, CloudFront, and the      #
+  # #   synthetic-data seeder. Kept below the focus resources on purpose.   #
+  # #                                                                       #
+  # #########################################################################
+
+  # =========================================================================
+  # Backend workload IAM role (EKS Pod Identity / service account).
+  # Referenced by the OpenSearch data-access policy above as a principal.
+  # Faithfully carries the CDK backend permissions (Bedrock, DynamoDB, S3,
+  # logs, X-Ray). Trust policy allows the EKS Pod Identity service principal.
+  # =========================================================================
+  BackendServiceAccountRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${StackName}-backend-sa-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowEksAuthToAssumeRoleForPodIdentity
+            Effect: Allow
+            Principal: { Service: pods.eks.amazonaws.com }
+            Action: ['sts:AssumeRole', 'sts:TagSession']
+      Policies:
+        - PolicyName: BackendBedrockAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'bedrock:InvokeModel'
+                  - 'bedrock:InvokeModelWithResponseStream'
+                Resource:
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/*'
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*'
+              - Effect: Allow
+                Action:
+                  - 'bedrock:ApplyGuardrail'
+                  - 'bedrock:Retrieve'
+                  - 'bedrock:RetrieveAndGenerate'
+                Resource:
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:guardrail/*'
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:knowledge-base/*'
+        - PolicyName: BackendDynamoDbAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'dynamodb:GetItem'
+                  - 'dynamodb:PutItem'
+                  - 'dynamodb:UpdateItem'
+                  - 'dynamodb:DeleteItem'
+                  - 'dynamodb:Query'
+                  - 'dynamodb:Scan'
+                  - 'dynamodb:BatchGetItem'
+                  - 'dynamodb:BatchWriteItem'
+                  - 'dynamodb:DescribeTable'
+                Resource:
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${StackName}-*-${Environment}'
+        - PolicyName: BackendS3AndObservability
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:PutObject'
+                  - 's3:DeleteObject'
+                  - 's3:ListBucket'
+                Resource:
+                  - !GetAtt DataBucket.Arn
+                  - !Sub '${DataBucket.Arn}/*'
+              - Effect: Allow
+                Action: ['aoss:APIAccessAll']
+                Resource: !Sub 'arn:aws:aoss:${AWS::Region}:${AWS::AccountId}:collection/*'
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                  - 'logs:DescribeLogStreams'
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/eks/${StackName}-cluster:*'
+              - Effect: Allow
+                Action:
+                  - 'xray:PutTraceSegments'
+                  - 'xray:PutTelemetryRecords'
+                Resource: '*'
+
+  # --- Pod Identity association: binds the backend role to the service acct.
+  BackendPodIdentityAssociation:
+    Type: AWS::EKS::PodIdentityAssociation
+    DependsOn: PodIdentityAgentAddon
+    Properties:
+      ClusterName: !Ref EksCluster
+      Namespace: !Sub '${StackName}-app'
+      ServiceAccount: !Sub '${StackName}-backend-sa'
+      RoleArn: !GetAtt BackendServiceAccountRole.Arn
+
+  # =========================================================================
+  # Cognito authentication (user pool, client, identity pool, initial user).
+  # =========================================================================
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub '${StackName}-user-pool'
+      AutoVerifiedAttributes: [email]
+      UsernameAttributes: [email]
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: false
+      Schema:
+        - Name: email
+          Required: true
+          Mutable: true
+          AttributeDataType: String
+
+  AdminGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      UserPoolId: !Ref UserPool
+      GroupName: !Sub '${StackName}-admin'
+      Precedence: 1
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      PreventUserExistenceErrors: ENABLED
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+
+  InitialUser:
+    Type: AWS::Cognito::UserPoolUser
+    Properties:
+      UserPoolId: !Ref UserPool
+      Username: !Ref EmailAddress
+      MessageAction: SUPPRESS
+      UserAttributes:
+        - { Name: email, Value: !Ref EmailAddress }
+        - { Name: email_verified, Value: 'true' }
+
+  IdentityPool:
+    Type: AWS::Cognito::IdentityPool
+    Properties:
+      IdentityPoolName: !Sub '${StackName}-identity-pool'
+      AllowUnauthenticatedIdentities: false
+      CognitoIdentityProviders:
+        - ClientId: !Ref UserPoolClient
+          ProviderName: !GetAtt UserPool.ProviderName
+
+  # Authenticated user role - scoped app permissions (Bedrock, DynamoDB, S3).
+  AuthenticatedRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: IAM role for authenticated Cognito users
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Federated: cognito-identity.amazonaws.com }
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                'cognito-identity.amazonaws.com:aud': !Ref IdentityPool
+              'ForAnyValue:StringLike':
+                'cognito-identity.amazonaws.com:amr': authenticated
+      Policies:
+        - PolicyName: AuthenticatedAppAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ['bedrock:InvokeModel', 'bedrock:InvokeModelWithResponseStream']
+                Resource:
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.nova-*'
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.titan-*'
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/anthropic.claude-*'
+              - Effect: Allow
+                Action: ['bedrock:ApplyGuardrail', 'bedrock:Retrieve']
+                Resource:
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:guardrail/*'
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:knowledge-base/*'
+              - Effect: Allow
+                Action: ['dynamodb:GetItem', 'dynamodb:Query', 'dynamodb:Scan']
+                Resource: !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${StackName}-*-${Environment}'
+              - Effect: Allow
+                Action: ['s3:GetObject', 's3:PutObject', 's3:DeleteObject', 's3:ListBucket']
+                Resource:
+                  - !GetAtt DataBucket.Arn
+                  - !Sub '${DataBucket.Arn}/*'
+
+  IdentityPoolRoleAttachment:
+    Type: AWS::Cognito::IdentityPoolRoleAttachment
+    Properties:
+      IdentityPoolId: !Ref IdentityPool
+      Roles:
+        authenticated: !GetAtt AuthenticatedRole.Arn
+
+  # =========================================================================
+  # CloudFront + Origin Access Control for the static frontend.
+  # UN-OPTIMISED: caching disabled (matches CDK CachePolicy TTL=0).
+  # =========================================================================
+  CloudFrontOac:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${StackName}-oac'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        Origins:
+          - Id: WebsiteS3Origin
+            DomainName: !GetAtt WebsiteBucket.RegionalDomainName
+            OriginAccessControlId: !Ref CloudFrontOac
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+        DefaultCacheBehavior:
+          TargetOriginId: WebsiteS3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          # CachingDisabled managed policy (matches CDK TTL=0 baseline).
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+          MinimumProtocolVersion: TLSv1.2_2021
+
+  WebsiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WebsiteBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontServicePrincipal
+            Effect: Allow
+            Principal: { Service: cloudfront.amazonaws.com }
+            Action: 's3:GetObject'
+            Resource: !Sub '${WebsiteBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                'AWS:SourceArn': !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}'
+          - Sid: AllowSSLRequestsOnly
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt WebsiteBucket.Arn
+              - !Sub '${WebsiteBucket.Arn}/*'
+            Condition:
+              Bool: { 'aws:SecureTransport': 'false' }
+
+  # =========================================================================
+  # Synthetic-data seeder (custom resource).
+  # In the CDK this is a ~700-line inline Lambda that populates the DynamoDB
+  # tables with demo users/schedules/tasks/products. For this architecture
+  # artefact the handler is a stub that shows the wiring (role, env, custom
+  # resource, dependencies); the full seeding logic lives in the CDK source at
+  # deployment/cdk/lib/synthetic-data-stack.ts and would be pasted into ZipFile
+  # (or better, packaged to S3) for a real deploy.
+  # =========================================================================
+  SeederRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SeederDynamoWrite
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ['dynamodb:PutItem', 'dynamodb:BatchWriteItem', 'dynamodb:Scan']
+                Resource: !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${StackName}-*-${Environment}'
+
+  SyntheticDataFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${StackName}-synthetic-data'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt SeederRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      LoggingConfig:
+        LogFormat: JSON
+      Environment:
+        Variables:
+          STACK_NAME: !Ref StackName
+          STACK_ENVIRONMENT: !Ref Environment
+          EMAIL: !Ref EmailAddress
+          COGNITO_PASSWORD: !Ref InitialPassword
+          LOG_LEVEL: !Ref LogLevel
+      Code:
+        ZipFile: |
+          import cfnresponse
+          # STUB for the architecture demo. Real seeding logic is in the CDK
+          # source (deployment/cdk/lib/synthetic-data-stack.ts). This wiring
+          # proves the custom-resource contract without deploying data.
+          def handler(event, context):
+              print(f"Seeder invoked: RequestType={event.get('RequestType')}")
+              # A real implementation would populate the DynamoDB tables here.
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, "SeederPhysicalId")
+
+  SeedData:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn:
+      - SessionHistoryTable
+      - UserTasksTable
+      - UserRoleTable
+      - CustomerTable
+      - DailyTasksByDayTable
+      - ScheduleTable
+      - TimeoffTable
+      - ProductsTable
+      - CustomerTransactionsTable
+      - FeedbackTable
+      - ImagesTable
+    Properties:
+      ServiceToken: !GetAtt SyntheticDataFunction.Arn
+
+  # =========================================================================
+  # CLOUDWATCH LOGGING OPTIMISATION TALKING POINT
+  # A small demo Lambda + an EXPLICIT log group.
+  #
+  # tradeoffs.md: "you haven't specified anything about logging... Amazon will
+  # just make that for us. But if we set it up, we get more granular control of
+  # retention and class. For a development parameter we can put logs as IA, but
+  # maybe not for production."
+  #
+  # OPTIMISED here (vs the baseline never-expire + STANDARD + DEBUG):
+  #   - Retention: finite (DemoLogRetentionDays now defaults to 30).
+  #   - Class: INFREQUENT_ACCESS for DEV, STANDARD for PROD (IsProd branch).
+  #   - App log level: INFO (see LogLevel parameter).
+  #
+  # By defining the log group explicitly (instead of letting Lambda auto-create
+  # it) we own retention/class and can tune them - which is the whole point.
+  # =========================================================================
+  DemoFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${StackName}-demo-fn'
+      # OPTIMISED: DEV -> INFREQUENT_ACCESS (cheaper ingestion/storage for logs
+      # you rarely query live); PROD stays STANDARD (full query/Live Tail/metric
+      # filter support). This is the tradeoffs.md "logs as IA for development" lever.
+      # VALIDATE: the IA log class does NOT support Live Tail, metric filters, or
+      # subscription filters. Confirm DEV does not rely on those. If PROD needs
+      # them, it must stay STANDARD (already handled by the IsProd branch).
+      LogGroupClass: !If [IsProd, STANDARD, INFREQUENT_ACCESS]
+      # OPTIMISED: retention is finite now (30d default). 0 would still map to
+      # never-expire via NeverExpireLogs, but the default is no longer 0.
+      # VALIDATE: confirm the retention meets audit/compliance requirements.
+      RetentionInDays: !If [NeverExpireLogs, !Ref AWS::NoValue, !Ref DemoLogRetentionDays]
+
+  DemoFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DemoFnLogsAndReadTable
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ['logs:CreateLogStream', 'logs:PutLogEvents']
+                Resource: !GetAtt DemoFunctionLogGroup.Arn
+              - Effect: Allow
+                Action: ['dynamodb:DescribeTable']
+                Resource: !GetAtt ProductsTable.Arn
+
+  # Small demo function: reports the product table's item count. Trivial by
+  # design - it exists to generate log traffic for the retention/class demo.
+  DemoFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${StackName}-demo-fn'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt DemoFunctionRole.Arn
+      Timeout: 30
+      # OPTIMISED: Lambda on Graviton (arm64). ~20% cheaper per GB-second than
+      # x86 at equal or better performance. The baseline had no Architectures key
+      # (defaults to x86_64). Same Graviton theme as the EKS nodes.
+      # VALIDATE: the function must run on arm64 - here it is pure Python + boto3
+      # (both arm64-native in the Lambda runtime), so it is safe. For functions
+      # with compiled/native deps, confirm arm64 wheels exist before switching.
+      Architectures:
+        - arm64
+      # OPTIMISED: right-sized 128 MB -> 256 MB. This trivial DescribeTable call
+      # is not memory-bound; the extra memory also raises the CPU allocation,
+      # which for very short invocations can lower duration enough to offset (or
+      # beat) the higher per-ms price.
+      # VALIDATE: this is workload-dependent - do NOT assume more memory is
+      # cheaper. Use AWS Lambda Power Tuning to find the cost/performance sweet
+      # spot from real invocation data, then set MemorySize to that result.
+      MemorySize: 256
+      LoggingConfig:
+        LogFormat: JSON
+        LogGroup: !Ref DemoFunctionLogGroup
+      Environment:
+        Variables:
+          PRODUCTS_TABLE: !Ref ProductsTable
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
+          LOG_LEVEL: !Ref LogLevel
+      Code:
+        ZipFile: |
+          import os, json, logging, boto3
+          # OPTIMISED: default log level INFO (was DEBUG) to cut log volume.
+          logging.getLogger().setLevel(os.environ.get("LOG_LEVEL", "INFO"))
+          log = logging.getLogger(__name__)
+          ddb = boto3.client("dynamodb")
+          def handler(event, context):
+              table = os.environ["PRODUCTS_TABLE"]
+              log.debug("Describing table %s", table)
+              desc = ddb.describe_table(TableName=table)
+              count = desc["Table"].get("ItemCount", 0)
+              log.info("Products table item count: %s", count)
+              return {"table": table, "itemCount": count}
+
+# ===========================================================================
+# Outputs
+# ===========================================================================
+Outputs:
+  EksClusterName:
+    Description: EKS cluster name
+    Value: !Ref EksCluster
+  BackendRepositoryUri:
+    Description: ECR repository URI for the backend image
+    Value: !GetAtt BackendRepository.RepositoryUri
+  DataBucketName:
+    Description: Data bucket (SOP docs + uploads; Bedrock KB source)
+    Value: !Ref DataBucket
+  WebsiteBucketName:
+    Description: Static frontend bucket
+    Value: !Ref WebsiteBucket
+  CloudFrontDomainName:
+    Description: CloudFront distribution domain (frontend URL)
+    Value: !GetAtt CloudFrontDistribution.DomainName
+  KnowledgeBaseId:
+    Description: Bedrock Knowledge Base ID
+    Value: !Ref BedrockKnowledgeBase
+  GuardrailId:
+    Description: Bedrock Guardrail ID
+    Value: !Ref BedrockGuardrail
+  OpenSearchCollectionEndpoint:
+    Description: OpenSearch Serverless collection endpoint
+    Value: !GetAtt OpenSearchCollection.CollectionEndpoint
+  UserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Description: Cognito User Pool Client ID
+    Value: !Ref UserPoolClient
+  IdentityPoolId:
+    Description: Cognito Identity Pool ID
+    Value: !Ref IdentityPool
+  DemoFunctionLogGroupName:
+    Description: Explicit demo log group (retention/class optimisation target)
+    Value: !Ref DemoFunctionLogGroup
+  S3BaselinePosture:
+    Description: >
+      Documents the S3 baseline for the trade-off talk (informational).
+      Reflects the S3StorageClassNote and EnableS3IntelligentTiering parameters.
+    Value: !Sub 'storageClass=${S3StorageClassNote}; intelligentTiering=${EnableS3IntelligentTiering}'

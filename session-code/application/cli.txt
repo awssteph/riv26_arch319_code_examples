@@ -1,0 +1,5 @@
+aws cloudformation deploy \
+  --template-file application/demo-source/01_s3_intelligent_tiering.yaml \
+  --stack-name reinvent-app-dev \
+  --parameter-overrides Environment=DEV \
+  --profile 'awssteph+reinvent-app-dev'

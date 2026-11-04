@@ -1,0 +1,77 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Transformation demo: replace an OpenSearch Serverless collection with standby replicas disabled.'
+
+Parameters:
+  TransformationStage:
+    Type: String
+    Default: BEFORE
+    AllowedValues: [BEFORE, AFTER]
+    Description: Choose BEFORE for standby replicas or AFTER without standby replicas.
+  CollectionNamePrefix:
+    Type: String
+    MinLength: 3
+    MaxLength: 20
+    AllowedPattern: '^[a-z][a-z0-9-]+$'
+    ConstraintDescription: Use 3-20 lowercase letters, numbers, and hyphens, starting with a letter.
+  OpenSearchVpcEndpointId:
+    Type: String
+    AllowedPattern: '^vpce-[a-z0-9]+$'
+    ConstraintDescription: Enter an existing OpenSearch Serverless VPC endpoint ID.
+
+
+Resources:
+
+  OpenSearchCollectionBefore:
+      Type: AWS::OpenSearchServerless::Collection
+      DependsOn:
+        - OpenSearchEncryptionPolicy
+        - OpenSearchNetworkPolicy
+      Properties:
+        Name: !Sub '${CollectionNamePrefix}-before'
+        Type: VECTORSEARCH
+        StandbyReplicas: ENABLED
+  
+  OpenSearchEncryptionPolicy:
+    Type: AWS::OpenSearchServerless::SecurityPolicy
+    Properties:
+      Name: !Sub '${CollectionNamePrefix}-encryption'
+      Type: encryption
+      Description: Encryption policy for the transformation demo collections.
+      Policy: !Sub |
+        {
+          "Rules": [
+            {
+              "ResourceType": "collection",
+              "Resource": ["collection/${CollectionNamePrefix}-*"]
+            }
+          ],
+          "AWSOwnedKey": true
+        }
+
+  OpenSearchNetworkPolicy:
+    Type: AWS::OpenSearchServerless::SecurityPolicy
+    Properties:
+      Name: !Sub '${CollectionNamePrefix}-network'
+      Type: network
+      Description: Private network policy for the transformation demo collections.
+      Policy: !Sub |
+        [
+          {
+            "Rules": [
+              {
+                "ResourceType": "collection",
+                "Resource": ["collection/${CollectionNamePrefix}-*"]
+              },
+              {
+                "ResourceType": "dashboard",
+                "Resource": ["collection/${CollectionNamePrefix}-*"]
+              }
+            ],
+            "AllowFromPublic": false,
+            "SourceVPCEs": ["${OpenSearchVpcEndpointId}"]
+          }
+        ]
+
+  
+
+

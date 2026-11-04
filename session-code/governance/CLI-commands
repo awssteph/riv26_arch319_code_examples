@@ -1,0 +1,10 @@
+aws organizations create-policy \
+  --type SERVICE_CONTROL_POLICY \
+  --name DenySpecificRegions \
+  --description "Deny usage of AWS Regions outside of the approved list" \
+  --content file://governance/deny-specific-regions.json
+
+
+aws organizations attach-policy \
+  --policy-id x-xxxxxxxx \
+  --target-id 154989746229

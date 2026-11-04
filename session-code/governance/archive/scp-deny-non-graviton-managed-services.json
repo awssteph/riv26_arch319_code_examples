@@ -1,0 +1,82 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DenyNonGravitonRDS",
+      "Effect": "Deny",
+      "Action": [
+        "rds:CreateDBInstance",
+        "rds:CreateDBCluster",
+        "rds:ModifyDBInstance",
+        "rds:ModifyDBCluster"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringNotLike": {
+          "rds:DatabaseClass": [
+            "db.r6g.*",
+            "db.r7g.*",
+            "db.r8g.*",
+            "db.m6g.*",
+            "db.m7g.*",
+            "db.m8g.*",
+            "db.t4g.*",
+            "db.x2g.*"
+          ]
+        },
+        "ArnNotLike": {
+          "aws:PrincipalArn": "arn:aws:iam::*:role/SuperAdmin"
+        }
+      }
+    },
+    {
+      "Sid": "DenyNonGravitonElastiCache",
+      "Effect": "Deny",
+      "Action": [
+        "elasticache:CreateCacheCluster",
+        "elasticache:CreateReplicationGroup",
+        "elasticache:ModifyCacheCluster",
+        "elasticache:ModifyReplicationGroup"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringNotLike": {
+          "elasticache:CacheNodeType": [
+            "cache.r6g.*",
+            "cache.r7g.*",
+            "cache.m6g.*",
+            "cache.m7g.*",
+            "cache.t4g.*"
+          ]
+        },
+        "ArnNotLike": {
+          "aws:PrincipalArn": "arn:aws:iam::*:role/SuperAdmin"
+        }
+      }
+    },
+    {
+      "Sid": "DenyNonGravitonOpenSearch",
+      "Effect": "Deny",
+      "Action": [
+        "es:CreateDomain",
+        "es:UpdateDomainConfig"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringNotLike": {
+          "es:InstanceType": [
+            "*.r6g.*",
+            "*.r7g.*",
+            "*.m6g.*",
+            "*.m7g.*",
+            "*.c6g.*",
+            "*.c7g.*"
+          ]
+        },
+        "ArnNotLike": {
+          "aws:PrincipalArn": "arn:aws:iam::*:role/SuperAdmin"
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,52 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DenyRegions",
+      "Effect": "Deny",
+      "NotAction": [
+        "account:*",
+        "billing:*",
+        "budgets:*",
+        "ce:*",
+        "cloudfront:*",
+        "cost-optimization-hub:*",
+        "cur:*",
+        "ec2:DescribeRegions",
+        "freetier:*",
+        "globalaccelerator:*",
+        "health:*",
+        "iam:*",
+        "networkmanager:*",
+        "notifications:*",
+        "organizations:*",
+        "pricing:*",
+        "route53:*",
+        "route53domains:*",
+        "s3:GetBucketLocation",
+        "s3:ListAllMyBuckets",
+        "shield:*",
+        "signin:*",
+        "sts:*",
+        "support:*",
+        "tax:*",
+        "trustedadvisor:*",
+        "waf:*",
+        "wafv2:*"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringNotEquals": {
+          "aws:RequestedRegion": [
+            "eu-west-1",
+            "eu-west-2",
+            "eu-west-3"
+          ]
+        },
+        "ArnNotLike": {
+          "aws:PrincipalArn": "arn:aws:iam::*:role/SuperAdmin"
+        }
+      }
+    }
+  ]
+}

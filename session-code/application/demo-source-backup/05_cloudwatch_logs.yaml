@@ -1,0 +1,23 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Transformation demo: apply finite retention and Infrequent Access to non-production CloudWatch logs.'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: DEV
+    AllowedValues: [DEV, PROD]
+    Description: Production retains the Standard log class for its feature set.
+
+Conditions:
+  IsProd: !Equals [!Ref Environment, PROD]
+
+Resources:
+
+  DemoFunctionLogGroupAfter:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: '/aws/lambda/lambda'
+      RetentionInDays: 30
+      LogGroupClass: !If [IsProd, STANDARD, INFREQUENT_ACCESS]
+      
+

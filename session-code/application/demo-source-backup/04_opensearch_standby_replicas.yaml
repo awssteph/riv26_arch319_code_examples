@@ -1,0 +1,52 @@
+# ===========================================================================
+# DEMO SNIPPET 4 - OpenSearch Serverless standby replicas
+# ===========================================================================
+# Teaching artefact only. Trimmed before/after of the AOSS collection.
+# Real resources live in ai_app_unoptimized.yaml / ai_app_optimized.yaml.
+#
+# THE STORY: OpenSearch Serverless bills in OCUs (OpenSearch Compute Units).
+# Standby replicas keep a redundant set of OCUs warm in a second AZ for faster
+# failover. Disabling them roughly HALVES the OCU count. OCUs are the single
+# biggest line item in this stack (~$350/mo in the cost table), so this is the
+# largest single saving in the whole demo.
+#
+# THE TRADE-OFF: you give up AZ-level redundancy / faster failover. Fine for
+# DEV and most non-prod. For PROD, confirm the availability SLA tolerates it
+# before disabling.
+#
+# GOTCHA (call this out): StandbyReplicas is set at COLLECTION CREATION. Changing
+# it REPLACES the collection - data loss + a Knowledge Base re-index. Decide
+# before the first deploy, not after.
+# ===========================================================================
+
+
+# ---------------------------------------------------------------------------
+# BEFORE (un-optimised): standby replicas ENABLED (redundant OCUs).
+# ---------------------------------------------------------------------------
+OpenSearchCollection_BEFORE:
+  Type: AWS::OpenSearchServerless::Collection
+  DependsOn:
+    - OpenSearchEncryptionPolicy
+    - OpenSearchNetworkPolicy
+  Properties:
+    Name: !Sub '${StackName}-collection'
+    Type: VECTORSEARCH
+    StandbyReplicas: ENABLED
+
+
+# ---------------------------------------------------------------------------
+# AFTER (optimised): standby replicas DISABLED (non-prod). ~halves OCUs.
+# ---------------------------------------------------------------------------
+OpenSearchCollection_AFTER:
+  Type: AWS::OpenSearchServerless::Collection
+  DependsOn:
+    - OpenSearchEncryptionPolicy
+    - OpenSearchNetworkPolicy
+  Properties:
+    Name: !Sub '${StackName}-collection'
+    Type: VECTORSEARCH
+    # OPTIMISED: ENABLED -> DISABLED. Biggest single saving in the stack.
+    # VALIDATE: acceptable for DEV/non-prod; for PROD confirm the RTO/
+    # availability SLA first. Remember this REPLACES the collection if changed
+    # after creation, so decide up front.
+    StandbyReplicas: DISABLED

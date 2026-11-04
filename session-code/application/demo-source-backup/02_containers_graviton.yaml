@@ -1,0 +1,119 @@
+# ===========================================================================
+# DEMO SNIPPET 3 - Graviton (ARM) compute for EKS nodes AND Lambda
+# ===========================================================================
+# Teaching artefact only. Trimmed before/after of the EKS node group knobs and
+# the demo Lambda. Real resources live in ai_app_unoptimized.yaml /
+# ai_app_optimized.yaml.
+#
+# THE STORY: Graviton (ARM) is ~20% cheaper than equivalent x86 for equal or
+# better performance. The same lever applies to BOTH compute types here - the
+# EKS worker nodes and the Lambda function. Before flipping either, check TWO
+# things:
+#   1. Does the software run on arm64? Every base image + pip wheel + native
+#      lib must build for aarch64. Our backend is pure Python + boto3, which is
+#      arm64-native, so it is safe. Compiled/native deps are where this bites.
+#   2. Right-sizing headroom. The move to ARM is a natural moment to right-size.
+#      Our backend is largely single-threaded per request, so a smaller shape
+#      may suffice - confirm with utilisation metrics first.
+#
+# LOCKSTEP RULE (EKS): the node AMI arch MUST match the instance arch or nodes
+# will not join the cluster. t4g (ARM) pairs with AL2023_ARM_64_STANDARD.
+# For Lambda there is no AMI - you just set Architectures: [arm64].
+# ===========================================================================
+
+
+# ---------------------------------------------------------------------------
+# BEFORE (un-optimised): x86 t3.medium on-demand, x86 AMI.
+# ---------------------------------------------------------------------------
+BackendNodeGroup_BEFORE:
+  Type: AWS::EKS::Nodegroup
+  Properties:
+    ClusterName: !Ref EksCluster
+    NodeRole: !GetAtt NodeGroupRole.Arn
+    InstanceTypes:
+      - t3.large                 # x86
+    AmiType: AL2023_x86_64_STANDARD
+    CapacityType: ON_DEMAND
+    ScalingConfig:
+      MinSize: 1
+      DesiredSize: 2
+      MaxSize: 4
+
+
+# ---------------------------------------------------------------------------
+# AFTER (optimised): Graviton t4g.medium + ARM AMI (changed in lockstep).
+# ---------------------------------------------------------------------------
+BackendNodeGroup_AFTER:
+  Type: AWS::EKS::Nodegroup
+  Properties:
+    ClusterName: !Ref EksCluster
+    NodeRole: !GetAtt NodeGroupRole.Arn
+    # OPTIMISED: x86 t3.medium -> Graviton t4g.medium (~20% cheaper, same
+    # 2 vCPU / 4 GiB shape). VALIDATE: rebuild the image with
+    # `docker build --platform=linux/arm64` and confirm it pushes/runs.
+    InstanceTypes:
+      - t4g.medium                # ARM / Graviton
+    # OPTIMISED: AMI switched to ARM in lockstep with the instance type.
+    # VALIDATE: AMI arch MUST match instance arch or nodes fail to join.
+    AmiType: AL2023_ARM_64_STANDARD
+    # Kept ON_DEMAND. SPOT is a further saving but a separate, riskier step
+    # (needs interruption tolerance) - do not bundle it in here.
+    CapacityType: ON_DEMAND
+    ScalingConfig:
+      MinSize: 1
+      DesiredSize: 2
+      MaxSize: 4
+    # RIGHT-SIZING note: after a load test, check CloudWatch Container Insights
+    # node_cpu_utilization / node_memory_utilization. If p90 CPU is comfortably
+    # below ~60%, a smaller shape may be justified - but confirm with data.
+
+
+# ===========================================================================
+# Same Graviton lever on the demo Lambda.
+# ===========================================================================
+
+#
+
+# ---------------------------------------------------------------------------
+# AFTER (optimised): arm64 (Graviton) + right-sized memory.
+# ---------------------------------------------------------------------------
+DemoFunction_AFTER:
+  Type: AWS::Lambda::Function
+  Properties:
+    FunctionName: !Sub '${StackName}-demo-fn'
+    Runtime: python3.12
+    Handler: index.handler
+    Role: !GetAtt DemoFunctionRole.Arn
+    Timeout: 30
+    # OPTIMISED: Lambda on Graviton (arm64). ~20% cheaper per GB-second than x86
+    # at equal or better performance - same Graviton theme as the EKS nodes.
+    # VALIDATE: the function must run on arm64. Here it is pure Python + boto3
+    # (both arm64-native in the Lambda runtime), so it is safe. For functions
+    # with compiled/native deps, confirm arm64 wheels exist before switching.
+    Architectures:
+      - arm64
+    # OPTIMISED: right-sized 128 MB -> 256 MB. This call is not memory-bound,
+    # but more memory also raises the CPU allocation, which for very short
+    # invocations can lower duration enough to offset (or beat) the higher price.
+    # VALIDATE: workload-dependent - do NOT assume more memory is cheaper. Use
+    # AWS Lambda Power Tuning to find the cost/performance sweet spot from real
+    # invocation data, then set MemorySize to that result.
+    MemorySize: 256
+    Environment:
+      Variables:
+        PRODUCTS_TABLE: !Ref ProductsTable
+        LOG_LEVEL: INFO
+    Code:
+      ZipFile: |
+        import os, logging, boto3
+        # Default log level INFO (was DEBUG) to cut log volume - see snippet 05.
+        logging.getLogger().setLevel(os.environ.get("LOG_LEVEL", "INFO"))
+        log = logging.getLogger(__name__)
+        ddb = boto3.client("dynamodb")
+        def handler(event, context):
+            table = os.environ["PRODUCTS_TABLE"]
+            log.debug("Describing table %s", table)
+            desc = ddb.describe_table(TableName=table)
+            count = desc["Table"].get("ItemCount", 0)
+            log.info("Products table item count: %s", count)
+            return {"table": table, "itemCount": count}

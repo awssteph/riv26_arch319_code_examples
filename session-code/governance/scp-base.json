@@ -1,0 +1,25 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "PolicyName",
+      "Effect": "",
+      "Action": [
+        ""
+      ],
+      "Resource": [
+
+      ],
+      "Condition": {
+        "StringNotLike": {
+          "aws:PrincipalArn": [
+
+          ]
+        },
+        "ArnNotLike": {
+          "aws:PrincipalArn": "arn:aws:iam::*:role/SuperAdmin"
+        }
+      }
+    }
+  ]
+}
